@@ -11,25 +11,30 @@ from langchain_community.chat_message_histories import SQLChatMessageHistory
 # -------------------------
 # 1) Chroma setup (Optimized Singleton)
 # -------------------------
+_CHROMA_CLIENT = None
 _CHROMA_COLLECTION = None
 
 def get_chroma_collection():
-    global _CHROMA_COLLECTION
+    global _CHROMA_CLIENT, _CHROMA_COLLECTION
     if _CHROMA_COLLECTION is not None:
         return _CHROMA_COLLECTION
 
+    import time
+    start = time.time()
     api_key = os.getenv("CHROMA_API_KEY")
     tenant = os.getenv("CHROMA_TENANT")
     database = os.getenv("CHROMA_DATABASE")
     collection_name = os.getenv("CHROMA_COLLECTION", "richmond_policies")
 
-    # Creating the client once saves significant network overhead
-    client = chromadb.CloudClient(
-        api_key=api_key,
-        tenant=tenant,
-        database=database
-    )
-    _CHROMA_COLLECTION = client.get_or_create_collection(name=collection_name)
+    if _CHROMA_CLIENT is None:
+        _CHROMA_CLIENT = chromadb.CloudClient(
+            api_key=api_key,
+            tenant=tenant,
+            database=database
+        )
+    
+    _CHROMA_COLLECTION = _CHROMA_CLIENT.get_collection(name=collection_name)
+    print(f"[TIMER] Chroma collection connected in {time.time() - start:.2f}s")
     return _CHROMA_COLLECTION
 
 # -------------------------
@@ -42,18 +47,27 @@ def search_richmond_policies(query: str):
     you need to look up specific rules, procedures, requirements, or details 
     about university life (alcohol, drugs, health, etc.).
     """
+    import time
+    start = time.time()
+    print(f"[TOOL] Searching for: {query}")
     collection = get_chroma_collection()
     results = collection.query(
         query_texts=[query],
-        n_results=15,
+        n_results=7,
         include=["documents", "metadatas"],
     )
+    print(f"[TIMER] Chroma query (7 results) took {time.time() - start:.2f}s")
 
     if not results.get("documents") or not results["documents"][0]:
         return "No relevant context found in the policy manual."
 
     docs = []
+    seen_texts = set()
     for text, meta in zip(results["documents"][0], results["metadatas"][0]):
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+        
         source = (meta or {}).get("source", "unknown")
         # Clean up source names
         clean_source = source.split("-")[1].replace("_", " ").title() if "-" in source else source
@@ -102,13 +116,22 @@ def build_chatbot():
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system",
-             "You are the official Richmond Policy Assistant. Your primary tool is the policy search tool.\n\n"
+             "You are the official Richmond Policy Assistant. Your role is to help students, staff, and faculty accurately understand official University of Richmond policies.\n\n"
+             "Your primary tool is the policy search tool.\n\n"
              "Guidelines:\n"
-             "1. Always search the policies if you are asked a factual question about Richmond.\n"
-             "2. Provide actual rules, requirements, or procedures. Do not just summarize.\n"
-             "3. If a user refers to a previous point (e.g., 'tell me more about #3'), look at the chat history to understand the context, then search for those specific details.\n"
-             "4. Always cite the Source Name provided in the tool output.\n"
-             "5. If you cannot find the info after searching, state that clearly."),
+             "1. If a user asks a factual or policy-related question about the University of Richmond, always search the policies before responding.\n"
+             "2. Provide exact rules, requirements, deadlines, or procedures when available. Do not speculate or provide unofficial guidance.\n"
+             "3. If a user refers to a previous response (e.g., 'tell me more about #3'), use the chat history to understand context, then search for the specific policy section.\n"
+             "4. Always cite the Source Name exactly as provided by the policy search tool.\n"
+             "5. If relevant policy information cannot be found, clearly state that and explain what information is missing.\n"
+             "6. Use a clear, calm, and student-friendly tone. Avoid legal jargon unless it appears in the policy.\n"
+             "7. If a question is ambiguous or missing details, ask a brief clarifying question before answering.\n"
+             "8. CRITICAL: When using the search_richmond_policies tool, you MUST rewrite the query to be standalone. Do not search for 'it', 'that policy', or 'the previous topic'. usage: search_richmond_policies(query='plagiarism policy for group projects') instead of search_richmond_policies(query='does it apply to group projects').\n"
+             "9. Format responses for readability:\n"
+             "   - **Bold the most important information** (deadlines, eligibility criteria, restrictions, requirements).\n"
+             "   - Use **bullet points or numbered lists** when outlining steps, rules, or multiple conditions.\n"
+             "   - Keep paragraphs short and scannable.\n"
+             "9. Do not reveal internal reasoning, tool calls, or scratchpad content."),
             ("placeholder", "{chat_history}"),
             ("user", "{input}"),
             ("placeholder", "{agent_scratchpad}"),
@@ -123,11 +146,25 @@ def build_chatbot():
         verbose=True, 
         handle_parsing_errors=True
     )
+    
+    # OUTPUT PARSER: Fixes the issue where ChatBedrock returns a list of blocks,
+    # causing the memory saver to crash with AttributeError.
+    def parse_agent_output(output_dict):
+        raw = output_dict.get("output", "")
+        if isinstance(raw, list):
+            # Flatten Claude's list of blocks into a single string
+            text_parts = [b.get("text", "") for b in raw if b.get("type") == "text"]
+            output_dict["output"] = " ".join(text_parts)
+        return output_dict
+
+    from langchain_core.runnables import RunnableLambda
+    chain_with_parser = executor | RunnableLambda(parse_agent_output)
 
     with_memory = RunnableWithMessageHistory(
-        executor,
+        chain_with_parser,
         get_history,
         input_messages_key="input",
         history_messages_key="chat_history",
+        output_messages_key="output",
     )
     return with_memory
